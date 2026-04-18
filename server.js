@@ -1,13 +1,15 @@
 /*
-  REDE SINAIS — Proxy Server v3
-  Consome o SSE stream do TipMiner em tempo real
-  URL: /stream/rounds/ROULETTE/660ec23b4bf4956ba238491c/v2/live?k=3
+  REDE SINAIS — Proxy Server v4
+  SSE stream do TipMiner com autenticação por cookie
 */
 
 const https = require('https');
 const http = require('http');
 
 const PORT = process.env.PORT || 3000;
+
+// Cookie de sessão do TipMiner (atualizar se expirar)
+const SESSION_COOKIE = 'b62fdfc8f6ea5dbc368542bd2556933aee3979f23cda0d887c312f7b81063292%7Cc9bef02446da20ce8e696365dcd57a62991e4e47950ad13f4d4c7ed87690a4b4';
 
 const ROULETTE_COLORS = {
   0:'branco',1:'vermelho',2:'preto',3:'vermelho',4:'preto',5:'vermelho',
@@ -21,118 +23,135 @@ const ROULETTE_COLORS = {
 
 function getColor(n) { return ROULETTE_COLORS[parseInt(n)] || 'branco'; }
 
-// ---- Buffer de rodadas (últimas 2h para garantir 1h disponível) ----
 let rodadasBuffer = [];
 let streamAtivo = false;
 let ultimoEvento = 0;
 let reconnectTimer = null;
+let rawEventosLog = []; // últimos 10 eventos brutos para debug
 
 function limparAntigas() {
-  const umaHoraAtras = Date.now() - 2 * 60 * 60 * 1000;
-  rodadasBuffer = rodadasBuffer.filter(r => r.timestamp > umaHoraAtras);
+  const limite = Date.now() - 2 * 60 * 60 * 1000;
+  rodadasBuffer = rodadasBuffer.filter(r => r.timestamp > limite);
 }
 
 function adicionarRodada(rodada) {
-  // Evitar duplicatas por horário
   const existe = rodadasBuffer.find(r => r.horario === rodada.horario);
   if (existe) return;
   rodadasBuffer.unshift(rodada);
   rodadasBuffer.sort((a, b) => b.timestamp - a.timestamp);
   limparAntigas();
-  console.log(`[${new Date().toISOString()}] Nova rodada: ${rodada.numero} (${rodada.cor}) mult: ${rodada.multiplicador}x @ ${rodada.horario}`);
+  console.log(`Nova rodada: ${rodada.numero} (${rodada.cor}) ${rodada.multiplicador}x @ ${rodada.horario}`);
+}
+
+function tsParaHorarioBRT(ts) {
+  const d = new Date(ts);
+  const utc = d.getTime() + d.getTimezoneOffset() * 60000;
+  const brt = new Date(utc - 3 * 3600000);
+  return String(brt.getHours()).padStart(2,'0') + ':' +
+         String(brt.getMinutes()).padStart(2,'0') + ':' +
+         String(brt.getSeconds()).padStart(2,'0');
 }
 
 function parsearEvento(dataStr) {
-  try {
-    // O stream envia JSON com dados da rodada
-    const obj = JSON.parse(dataStr);
+  // Guardar log bruto para debug
+  rawEventosLog.unshift({ ts: new Date().toISOString(), data: dataStr.substring(0, 500) });
+  if (rawEventosLog.length > 10) rawEventosLog.pop();
 
-    // Extrair número da roleta
+  try {
+    const obj = JSON.parse(dataStr);
+    console.log('JSON parsed keys:', Object.keys(obj).join(', '));
+
+    // Extrair número
     const numero = parseInt(
-      obj.result ?? obj.number ?? obj.outcome ?? obj.num ?? obj.n ?? 0
+      obj.result ?? obj.number ?? obj.outcome ?? obj.num ??
+      obj.winningNumber ?? obj.winning_number ?? obj.slot ?? 0
     );
 
-    // Extrair multiplicadores — pode vir em vários formatos
+    // Extrair multiplicadores — múltiplos formatos possíveis
     let multiplicadores = [];
-    if (obj.multipliers && Array.isArray(obj.multipliers)) {
-      multiplicadores = obj.multipliers.map(m => parseInt(m.value ?? m.multiplier ?? m) || 0).filter(m => m >= 50);
-    } else if (obj.lightning && Array.isArray(obj.lightning)) {
-      multiplicadores = obj.lightning.map(m => parseInt(m.multiplier ?? m.value ?? m) || 0).filter(m => m >= 50);
-    } else if (obj.multiplier && parseInt(obj.multiplier) >= 50) {
+
+    if (Array.isArray(obj.multipliers)) {
+      multiplicadores = obj.multipliers
+        .map(m => parseInt(m?.value ?? m?.multiplier ?? m?.mult ?? m) || 0)
+        .filter(m => m >= 50);
+    }
+    if (!multiplicadores.length && Array.isArray(obj.lightning)) {
+      multiplicadores = obj.lightning
+        .map(m => parseInt(m?.multiplier ?? m?.value ?? m) || 0)
+        .filter(m => m >= 50);
+    }
+    if (!multiplicadores.length && Array.isArray(obj.lightningNumbers)) {
+      multiplicadores = obj.lightningNumbers
+        .map(m => parseInt(m?.multiplier ?? m?.mult ?? m) || 0)
+        .filter(m => m >= 50);
+    }
+    if (!multiplicadores.length && obj.multiplier && parseInt(obj.multiplier) >= 50) {
       multiplicadores = [parseInt(obj.multiplier)];
-    } else if (obj.mult && parseInt(obj.mult) >= 50) {
+    }
+    if (!multiplicadores.length && obj.mult && parseInt(obj.mult) >= 50) {
       multiplicadores = [parseInt(obj.mult)];
     }
+    if (!multiplicadores.length && obj.maxMultiplier && parseInt(obj.maxMultiplier) >= 50) {
+      multiplicadores = [parseInt(obj.maxMultiplier)];
+    }
 
-    // Só processar rodadas COM multiplicador
-    if (multiplicadores.length === 0) return null;
+    // Procurar multiplicadores em qualquer campo numérico >= 50
+    if (!multiplicadores.length) {
+      for (const [key, val] of Object.entries(obj)) {
+        if (typeof val === 'number' && val >= 50 && val <= 2000 && key.toLowerCase().includes('mult')) {
+          multiplicadores.push(val);
+        }
+      }
+    }
+
+    if (!multiplicadores.length) return null;
 
     const maxMult = Math.max(...multiplicadores);
 
-    // Extrair horário
+    // Extrair timestamp
     let timestamp = Date.now();
+    if (obj.createdAt) timestamp = new Date(obj.createdAt).getTime();
+    else if (obj.timestamp) timestamp = typeof obj.timestamp === 'number' ? (obj.timestamp < 1e12 ? obj.timestamp * 1000 : obj.timestamp) : new Date(obj.timestamp).getTime();
+    else if (obj.time && typeof obj.time === 'string' && !obj.time.match(/^\d{2}:\d{2}/)) timestamp = new Date(obj.time).getTime();
+    else if (obj.date) timestamp = new Date(obj.date).getTime();
+    else if (obj.startedAt) timestamp = new Date(obj.startedAt).getTime();
+    else if (obj.endedAt) timestamp = new Date(obj.endedAt).getTime();
+
     let horario = '';
-
-    if (obj.createdAt) {
-      timestamp = new Date(obj.createdAt).getTime();
-    } else if (obj.timestamp) {
-      timestamp = typeof obj.timestamp === 'number'
-        ? (obj.timestamp < 1e12 ? obj.timestamp * 1000 : obj.timestamp)
-        : new Date(obj.timestamp).getTime();
-    } else if (obj.time) {
-      if (typeof obj.time === 'string' && obj.time.match(/\d{2}:\d{2}:\d{2}/)) {
-        horario = obj.time;
-      } else {
-        timestamp = new Date(obj.time).getTime();
-      }
-    } else if (obj.date) {
-      timestamp = new Date(obj.date).getTime();
+    if (obj.time && typeof obj.time === 'string' && obj.time.match(/\d{2}:\d{2}:\d{2}/)) {
+      horario = obj.time.match(/(\d{2}:\d{2}:\d{2})/)[1];
+    } else {
+      horario = tsParaHorarioBRT(timestamp);
     }
 
-    if (!horario) {
-      // Converter timestamp UTC para BRT (UTC-3)
-      const d = new Date(timestamp);
-      const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-      const brt = new Date(utc - 3 * 3600000);
-      horario = String(brt.getHours()).padStart(2,'0') + ':' +
-                String(brt.getMinutes()).padStart(2,'0') + ':' +
-                String(brt.getSeconds()).padStart(2,'0');
-    }
-
-    return {
-      numero,
-      cor: getColor(numero),
-      multiplicador: maxMult,
-      todosMultiplicadores: multiplicadores,
-      horario,
-      timestamp,
-      raw: obj, // para debug
-    };
+    return { numero, cor: getColor(numero), multiplicador: maxMult, todosMultiplicadores: multiplicadores, horario, timestamp };
 
   } catch(e) {
-    // Tentar extrair dados com regex se JSON falhar
-    const multMatch = dataStr.match(/(\d{3,4})x/i);
-    const timeMatch = dataStr.match(/(\d{2}:\d{2}:\d{2})/);
-    if (multMatch && timeMatch && parseInt(multMatch[1]) >= 50) {
-      const horario = timeMatch[1];
+    // Não é JSON — tentar regex
+    const multMatch = dataStr.match(/\b(\d{3,4})x\b/i);
+    const timeMatch = dataStr.match(/\b(\d{2}:\d{2}:\d{2})\b/);
+    const numMatch = dataStr.match(/"(?:result|number|outcome|slot)"\s*:\s*(\d+)/);
+
+    if (multMatch && parseInt(multMatch[1]) >= 50) {
       const mult = parseInt(multMatch[1]);
+      const horario = timeMatch ? timeMatch[1] : tsParaHorarioBRT(Date.now());
+      const numero = numMatch ? parseInt(numMatch[1]) : 0;
       const [h, m, s] = horario.split(':').map(Number);
       const now = Date.now();
       const brtNow = new Date(now - 3 * 3600000);
       const d = new Date(Date.UTC(brtNow.getUTCFullYear(), brtNow.getUTCMonth(), brtNow.getUTCDate(), h+3, m, s));
       let ts = d.getTime();
       if (ts > now + 60000) ts -= 24*3600000;
-      return { numero: 0, cor: 'branco', multiplicador: mult, todosMultiplicadores: [mult], horario, timestamp: ts };
+      return { numero, cor: getColor(numero), multiplicador: mult, todosMultiplicadores: [mult], horario, timestamp: ts };
     }
     return null;
   }
 }
 
-// ---- Conectar ao SSE stream do TipMiner ----
 function conectarStream() {
   if (streamAtivo) return;
   streamAtivo = true;
-  console.log(`[${new Date().toISOString()}] Conectando ao stream do TipMiner...`);
+  console.log(`[${new Date().toISOString()}] Conectando ao stream...`);
 
   const options = {
     hostname: 'www.tipminer.com',
@@ -143,83 +162,56 @@ function conectarStream() {
       'Accept': 'text/event-stream',
       'Accept-Language': 'pt-BR,pt;q=0.9',
       'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
       'Referer': 'https://www.tipminer.com/br/historico/evolution/xxxtreme-lightning-roulette',
       'Origin': 'https://www.tipminer.com',
+      'Cookie': `session=${SESSION_COOKIE}`,
     }
   };
 
   const req = https.request(options, (res) => {
-    console.log(`Stream conectado: HTTP ${res.statusCode}`);
-
+    console.log(`Stream HTTP ${res.statusCode}`);
     if (res.statusCode !== 200) {
-      console.error('Stream retornou status inesperado:', res.statusCode);
+      console.error('Status inesperado:', res.statusCode);
       streamAtivo = false;
-      agendarReconexao();
+      agendarReconexao(10000);
       return;
     }
 
     let buffer = '';
-
     res.on('data', (chunk) => {
       ultimoEvento = Date.now();
       buffer += chunk.toString('utf8');
-
-      // Processar eventos SSE (separados por \n\n)
       const eventos = buffer.split('\n\n');
-      buffer = eventos.pop(); // último pode estar incompleto
+      buffer = eventos.pop();
 
       for (const evento of eventos) {
         if (!evento.trim()) continue;
-
         const linhas = evento.split('\n');
-        let tipo = '';
-        let dados = '';
-
+        let tipo = '', dados = '';
         for (const linha of linhas) {
-          if (linha.startsWith('event:')) {
-            tipo = linha.slice(6).trim();
-          } else if (linha.startsWith('data:')) {
-            dados = linha.slice(5).trim();
-          }
+          if (linha.startsWith('event:')) tipo = linha.slice(6).trim();
+          else if (linha.startsWith('data:')) dados = linha.slice(5).trim();
         }
-
-        if (tipo === 'ping') continue; // ignorar pings
-        console.log('RAW EVENTO:', JSON.stringify({tipo, dados: dados.substring(0, 300)}));
-
-        if (dados && dados !== 'ping') {
-          console.log(`Evento: ${tipo || 'update'} | dados: ${dados.substring(0, 100)}`);
-          const rodada = parsearEvento(dados);
-          if (rodada) adicionarRodada(rodada);
-        }
+        if (!dados || dados === 'ping' || tipo === 'ping') continue;
+        console.log(`Evento [${tipo||'?'}]: ${dados.substring(0, 150)}`);
+        const rodada = parsearEvento(dados);
+        if (rodada) adicionarRodada(rodada);
       }
     });
 
-    res.on('end', () => {
-      console.log('Stream encerrado pelo servidor. Reconectando...');
-      streamAtivo = false;
-      agendarReconexao();
-    });
-
-    res.on('error', (err) => {
-      console.error('Erro no stream:', err.message);
-      streamAtivo = false;
-      agendarReconexao();
-    });
+    res.on('end', () => { console.log('Stream encerrado, reconectando...'); streamAtivo = false; agendarReconexao(); });
+    res.on('error', (e) => { console.error('Erro stream:', e.message); streamAtivo = false; agendarReconexao(); });
   });
 
-  req.on('error', (err) => {
-    console.error('Erro ao conectar stream:', err.message);
-    streamAtivo = false;
-    agendarReconexao();
-  });
-
-  req.setTimeout(0); // sem timeout — é stream contínuo
+  req.on('error', (e) => { console.error('Erro conexão:', e.message); streamAtivo = false; agendarReconexao(); });
+  req.setTimeout(0);
   req.end();
 
-  // Watchdog: se não receber nada em 2 minutos, reconectar
+  // Watchdog 2 min
   setInterval(() => {
     if (streamAtivo && ultimoEvento > 0 && Date.now() - ultimoEvento > 120000) {
-      console.log('Watchdog: stream inativo por 2min, reconectando...');
+      console.log('Watchdog: reconectando...');
       req.destroy();
       streamAtivo = false;
       agendarReconexao();
@@ -229,13 +221,9 @@ function conectarStream() {
 
 function agendarReconexao(delay = 5000) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    streamAtivo = false;
-    conectarStream();
-  }, delay);
+  reconnectTimer = setTimeout(() => { streamAtivo = false; conectarStream(); }, delay);
 }
 
-// ---- Servidor HTTP ----
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -247,27 +235,15 @@ const server = http.createServer((req, res) => {
   if (url === '/api/roleta' || url === '/') {
     limparAntigas();
     const umaHoraAtras = Date.now() - 60 * 60 * 1000;
-    const rodadasUltimaHora = rodadasBuffer.filter(r => r.timestamp > umaHoraAtras);
+    const rodadas = rodadasBuffer.filter(r => r.timestamp > umaHoraAtras);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
-      ok: true,
-      source: 'stream',
-      lastFetch: ultimoEvento || Date.now(),
-      total: rodadasUltimaHora.length,
-      streamAtivo,
-      rodadas: rodadasUltimaHora,
-    }));
+    res.end(JSON.stringify({ ok: true, source: 'stream', lastFetch: ultimoEvento || Date.now(), total: rodadas.length, streamAtivo, rodadas }));
     return;
   }
 
   if (url === '/debug') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
-      streamAtivo,
-      ultimoEvento: ultimoEvento ? new Date(ultimoEvento).toISOString() : null,
-      totalBuffer: rodadasBuffer.length,
-      ultimasRodadas: rodadasBuffer.slice(0, 5),
-    }, null, 2));
+    res.end(JSON.stringify({ streamAtivo, ultimoEvento: ultimoEvento ? new Date(ultimoEvento).toISOString() : null, totalBuffer: rodadasBuffer.length, ultimasRodadas: rodadasBuffer.slice(0,5), rawEventos: rawEventosLog }, null, 2));
     return;
   }
 
@@ -281,7 +257,4 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ ok: false, error: 'Not found' }));
 });
 
-server.listen(PORT, () => {
-  console.log(`Rede Sinais Proxy v3 na porta ${PORT}`);
-  conectarStream();
-});
+server.listen(PORT, () => { console.log(`Rede Sinais Proxy v4 na porta ${PORT}`); conectarStream(); });

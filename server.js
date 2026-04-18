@@ -184,6 +184,7 @@ function conectarStream() {
         }
 
         if (tipo === 'ping') continue; // ignorar pings
+        console.log('RAW EVENTO:', JSON.stringify({tipo, dados: dados.substring(0, 300)}));
 
         if (dados && dados !== 'ping') {
           console.log(`Evento: ${tipo || 'update'} | dados: ${dados.substring(0, 100)}`);

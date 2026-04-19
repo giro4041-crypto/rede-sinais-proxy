@@ -1,10 +1,13 @@
 {
   "name": "rede-sinais-proxy",
-  "version": "1.0.0",
-  "description": "Proxy server para scraping do TipMiner — Rede Sinais",
+  "version": "5.0.0",
+  "description": "Proxy server com Puppeteer para Rede Sinais",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0"
   },
   "engines": {
     "node": ">=18.0.0"

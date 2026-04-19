@@ -1,10 +1,10 @@
 /*
-  REDE SINAIS — Proxy Server v5 (Puppeteer)
-  Abre o casino.org com Chrome headless e extrai os dados renderizados
+  REDE SINAIS — Proxy Server v6
+  Chama direto a API do casino.org
 */
 
+const https = require('https');
 const http = require('http');
-const puppeteer = require('puppeteer');
 
 const PORT = process.env.PORT || 3000;
 
@@ -21,215 +21,127 @@ const ROULETTE_COLORS = {
 function getColor(n) { return ROULETTE_COLORS[parseInt(n)] || 'branco'; }
 
 let cache = { data: [], lastFetch: 0, ttl: 30000 };
-let browser = null;
-let buscando = false;
 
-// ---- Iniciar browser ----
-async function getBrowser() {
-  if (browser && browser.isConnected()) return browser;
-  console.log('Iniciando Puppeteer...');
-  browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-    ]
+function fetchJSON(url) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, */*',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+        'Referer': 'https://www.casino.org/',
+        'Origin': 'https://www.casino.org',
+      }
+    };
+    const req = https.get(url, options, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        console.log(`GET ${url} → ${res.statusCode} (${body.length} chars)`);
+        try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
+        catch(e) { resolve({ status: res.statusCode, data: null, raw: body.substring(0, 200) }); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
   });
-  console.log('Puppeteer iniciado!');
-  return browser;
 }
 
-// ---- Buscar dados com Puppeteer ----
-async function fetchComPuppeteer() {
-  if (buscando) return cache.data;
-  buscando = true;
-
-  let page = null;
-  try {
-    const b = await getBrowser();
-    page = await b.newPage();
-
-    // Bloquear recursos desnecessários para ser mais rápido
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const tipo = req.resourceType();
-      if (['image', 'media', 'font', 'stylesheet'].includes(tipo)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    // Interceptar chamadas de API para capturar dados JSON diretamente
-    let apiData = null;
-    page.on('response', async (response) => {
-      const url = response.url();
-      if (url.includes('/api/') || url.includes('spins') || url.includes('rounds') || url.includes('history')) {
-        try {
-          const text = await response.text();
-          if (text.startsWith('[') || text.startsWith('{')) {
-            console.log('API capturada:', url);
-            apiData = JSON.parse(text);
-          }
-        } catch(e) {}
-      }
-    });
-
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1280, height: 800 });
-
-    console.log('Abrindo casino.org...');
-    await page.goto('https://www.casino.org/casinoscores/pt-br/xxxtreme-lightning-roulette/', {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
-
-    // Aguardar tabela de histórico carregar
-    await page.waitForSelector('table, [class*="spin"], [class*="round"], [class*="history"], [class*="result"]', {
-      timeout: 15000
-    }).catch(() => console.log('Seletor não encontrado, tentando extrair mesmo assim...'));
-
-    // Aguardar mais um pouco para dados renderizarem
-    await new Promise(r => setTimeout(r, 3000));
-
-    // Se capturou dados via API, usar eles
-    if (apiData) {
-      console.log('Usando dados da API interceptada');
-      buscando = false;
-      return parsearApiData(apiData);
-    }
-
-    // Extrair dados do DOM renderizado
-    const rodadas = await page.evaluate(() => {
-      const resultados = [];
-      const agora = Date.now();
-      const umaHoraAtras = agora - 60 * 60 * 1000;
-
-      // Tentar encontrar linhas de tabela com dados de rodadas
-      const seletores = [
-        'table tbody tr',
-        '[class*="spin-row"]',
-        '[class*="round-row"]',
-        '[class*="history-row"]',
-        '[class*="result-row"]',
-        '[class*="SpinRow"]',
-        '[class*="RoundRow"]',
-      ];
-
-      let linhas = [];
-      for (const sel of seletores) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) { linhas = Array.from(els); break; }
-      }
-
-      for (const linha of linhas) {
-        const texto = linha.innerText || linha.textContent || '';
-        if (!texto.trim()) continue;
-
-        // Extrair horário
-        const timeMatch = texto.match(/(\d{2}:\d{2}:\d{2})/);
-        if (!timeMatch) continue;
-        const horario = timeMatch[1];
-
-        // Extrair multiplicador
-        const multMatches = texto.match(/(\d{2,4})x/gi);
-        if (!multMatches) continue;
-        const multiplicadores = multMatches.map(m => parseInt(m)).filter(m => m >= 50);
-        if (!multiplicadores.length) continue;
-
-        // Extrair número da roleta (0-36)
-        const numMatch = texto.match(/\b(3[0-6]|[12][0-9]|[0-9])\b/);
-        const numero = numMatch ? parseInt(numMatch[1]) : 0;
-
-        resultados.push({ horario, numero, multiplicador: Math.max(...multiplicadores), multiplicadores });
-      }
-
-      return resultados;
-    });
-
-    console.log(`Extraídas ${rodadas.length} rodadas do DOM`);
-
-    // Se não achou no DOM, tentar pegar texto completo e parsear
-    if (rodadas.length === 0) {
-      const textoCompleto = await page.evaluate(() => document.body.innerText);
-      console.log('Texto página (500 chars):', textoCompleto.substring(0, 500));
-
-      // Salvar HTML para debug
-      const htmlCompleto = await page.content();
-      console.log('HTML length:', htmlCompleto.length);
-    }
-
-    await page.close();
-    buscando = false;
-    return processarRodadas(rodadas);
-
-  } catch(err) {
-    console.error('Erro Puppeteer:', err.message);
-    if (page) await page.close().catch(() => {});
-    buscando = false;
-    throw err;
-  }
+function tsParaHorarioBRT(ts) {
+  const d = new Date(ts);
+  const utc = d.getTime() + d.getTimezoneOffset() * 60000;
+  const brt = new Date(utc - 3 * 3600000);
+  return String(brt.getHours()).padStart(2,'0') + ':' +
+         String(brt.getMinutes()).padStart(2,'0') + ':' +
+         String(brt.getSeconds()).padStart(2,'0');
 }
 
-function parsearApiData(data) {
-  const resultados = [];
+function parsearRodadas(data) {
   const agora = Date.now();
   const umaHoraAtras = agora - 60 * 60 * 1000;
+  const resultados = [];
 
-  const arr = Array.isArray(data) ? data : (data.data || data.results || data.rounds || data.spins || []);
+  // Normalizar para array
+  const arr = Array.isArray(data) ? data
+    : data?.data ?? data?.results ?? data?.rounds
+    ?? data?.spins ?? data?.history ?? data?.items ?? [];
+
+  console.log(`Parseando ${arr.length} itens...`);
 
   for (const item of arr) {
-    const numero = parseInt(item.result ?? item.number ?? item.outcome ?? item.winningNumber ?? 0);
+    if (typeof item !== 'object') continue;
+
+    // Extrair número
+    const numero = parseInt(
+      item.result ?? item.number ?? item.outcome ??
+      item.winningNumber ?? item.winning_number ??
+      item.slot ?? item.num ?? 0
+    );
+
+    // Extrair multiplicadores
     let multiplicadores = [];
+    if (Array.isArray(item.multipliers)) {
+      multiplicadores = item.multipliers
+        .map(m => parseInt(m?.value ?? m?.multiplier ?? m?.mult ?? m) || 0)
+        .filter(m => m >= 50);
+    }
+    if (!multiplicadores.length && Array.isArray(item.lightningNumbers)) {
+      multiplicadores = item.lightningNumbers
+        .map(m => parseInt(m?.multiplier ?? m?.value ?? m?.mult ?? m) || 0)
+        .filter(m => m >= 50);
+    }
+    if (!multiplicadores.length && Array.isArray(item.lightning)) {
+      multiplicadores = item.lightning
+        .map(m => parseInt(m?.multiplier ?? m?.value ?? m) || 0)
+        .filter(m => m >= 50);
+    }
+    if (!multiplicadores.length && item.multiplier && parseInt(item.multiplier) >= 50) {
+      multiplicadores = [parseInt(item.multiplier)];
+    }
+    if (!multiplicadores.length && item.maxMultiplier && parseInt(item.maxMultiplier) >= 50) {
+      multiplicadores = [parseInt(item.maxMultiplier)];
+    }
+    if (!multiplicadores.length && item.topMultiplier && parseInt(item.topMultiplier) >= 50) {
+      multiplicadores = [parseInt(item.topMultiplier)];
+    }
 
-    if (Array.isArray(item.multipliers)) multiplicadores = item.multipliers.map(m => parseInt(m.value ?? m.multiplier ?? m) || 0).filter(m => m >= 50);
-    else if (item.multiplier && parseInt(item.multiplier) >= 50) multiplicadores = [parseInt(item.multiplier)];
-    else if (item.maxMultiplier && parseInt(item.maxMultiplier) >= 50) multiplicadores = [parseInt(item.maxMultiplier)];
-
+    // Só incluir rodadas COM multiplicador
     if (!multiplicadores.length) continue;
 
+    // Extrair timestamp
     let timestamp = agora;
-    if (item.timestamp) timestamp = typeof item.timestamp === 'number' ? (item.timestamp < 1e12 ? item.timestamp * 1000 : item.timestamp) : new Date(item.timestamp).getTime();
-    else if (item.createdAt) timestamp = new Date(item.createdAt).getTime();
-    else if (item.time) timestamp = new Date(item.time).getTime();
+    const timeVal = item.timestamp ?? item.createdAt ?? item.created_at ??
+                    item.time ?? item.date ?? item.startedAt ?? item.endedAt;
+
+    if (timeVal) {
+      if (typeof timeVal === 'number') {
+        timestamp = timeVal < 1e12 ? timeVal * 1000 : timeVal;
+      } else {
+        timestamp = new Date(timeVal).getTime();
+      }
+    }
 
     if (timestamp < umaHoraAtras) continue;
 
-    const d = new Date(timestamp);
-    const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-    const brt = new Date(utc - 3 * 3600000);
-    const horario = String(brt.getHours()).padStart(2,'0') + ':' + String(brt.getMinutes()).padStart(2,'0') + ':' + String(brt.getSeconds()).padStart(2,'0');
+    const horario = tsParaHorarioBRT(timestamp);
+    const maxMult = Math.max(...multiplicadores);
 
-    resultados.push({ numero, cor: getColor(numero), multiplicador: Math.max(...multiplicadores), todosMultiplicadores: multiplicadores, horario, timestamp });
+    resultados.push({
+      numero,
+      cor: getColor(numero),
+      multiplicador: maxMult,
+      todosMultiplicadores: multiplicadores,
+      horario,
+      timestamp,
+    });
   }
 
-  return resultados;
-}
-
-function processarRodadas(rodadas) {
-  const agora = Date.now();
-  const umaHoraAtras = agora - 60 * 60 * 1000;
-
-  return rodadas.map(r => {
-    const [h, m, s] = r.horario.split(':').map(Number);
-    const brtNow = new Date(agora - 3 * 3600000);
-    const d = new Date(Date.UTC(brtNow.getUTCFullYear(), brtNow.getUTCMonth(), brtNow.getUTCDate(), h+3, m, s));
-    let ts = d.getTime();
-    if (ts > agora + 60000) ts -= 24 * 3600000;
-    return {
-      numero: r.numero,
-      cor: getColor(r.numero),
-      multiplicador: r.multiplicador,
-      todosMultiplicadores: r.multiplicadores,
-      horario: r.horario,
-      timestamp: ts,
-    };
-  }).filter(r => r.timestamp > umaHoraAtras)
+  // Remover duplicatas e ordenar
+  const seen = new Set();
+  return resultados
+    .filter(r => { if (seen.has(r.horario)) return false; seen.add(r.horario); return true; })
     .sort((a, b) => b.timestamp - a.timestamp);
 }
 
@@ -238,14 +150,39 @@ async function getData() {
   if (cache.data.length > 0 && agora - cache.lastFetch < cache.ttl) {
     return { source: 'cache', data: cache.data, lastFetch: cache.lastFetch };
   }
-  const data = await fetchComPuppeteer();
-  cache.data = data;
+
+  // Tentar os endpoints capturados pelo Puppeteer
+  const endpoints = [
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/latest',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/stats?duration=1',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/stats?duration=6',
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const result = await fetchJSON(url);
+      if (result.status === 200 && result.data) {
+        console.log('Resposta de', url, ':', JSON.stringify(result.data).substring(0, 300));
+        const rodadas = parsearRodadas(result.data);
+        if (rodadas.length > 0) {
+          cache.data = rodadas;
+          cache.lastFetch = agora;
+          console.log(`[${new Date().toISOString()}] ${rodadas.length} rodadas encontradas via ${url}`);
+          return { source: 'live', data: rodadas, lastFetch: agora };
+        }
+      }
+    } catch(e) {
+      console.error('Erro em', url, ':', e.message);
+    }
+  }
+
+  // Nenhum endpoint retornou dados
+  console.log('Nenhum endpoint retornou rodadas com multiplicador');
   cache.lastFetch = agora;
-  console.log(`[${new Date().toISOString()}] ${data.length} rodadas com multiplicador`);
-  return { source: 'live', data, lastFetch: agora };
+  return { source: 'live', data: [], lastFetch: agora };
 }
 
-// ---- Servidor HTTP ----
+// ---- Servidor ----
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -259,14 +196,33 @@ const server = http.createServer(async (req, res) => {
       const result = await getData();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, source: result.source, lastFetch: result.lastFetch, total: result.data.length, rodadas: result.data }));
-    } catch (err) {
-      if (cache.data.length > 0) {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, source: 'cache-fallback', lastFetch: cache.lastFetch, total: cache.data.length, rodadas: cache.data }));
-      } else {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
+    } catch(err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+    return;
+  }
+
+  // Debug — mostra resposta bruta das APIs
+  if (url === '/debug') {
+    try {
+      const endpoints = [
+        'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/latest',
+        'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/stats?duration=1',
+      ];
+      const results = {};
+      for (const ep of endpoints) {
+        try {
+          const r = await fetchJSON(ep);
+          results[ep] = { status: r.status, preview: JSON.stringify(r.data ?? r.raw).substring(0, 500) };
+        } catch(e) {
+          results[ep] = { error: e.message };
+        }
       }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(results, null, 2));
+    } catch(e) {
+      res.writeHead(500); res.end(e.message);
     }
     return;
   }
@@ -281,13 +237,7 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ ok: false, error: 'Not found' }));
 });
 
-server.listen(PORT, async () => {
-  console.log(`Rede Sinais Proxy v5 (Puppeteer) na porta ${PORT}`);
-  await getBrowser().catch(console.error);
+server.listen(PORT, () => {
+  console.log(`Rede Sinais Proxy v6 na porta ${PORT}`);
   getData().catch(console.error);
-});
-
-process.on('SIGTERM', async () => {
-  if (browser) await browser.close();
-  process.exit(0);
 });

@@ -1,13 +1,10 @@
 {
   "name": "rede-sinais-proxy",
-  "version": "5.0.0",
-  "description": "Proxy server com Puppeteer para Rede Sinais",
+  "version": "6.0.0",
+  "description": "Proxy server para Rede Sinais",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
-  },
-  "dependencies": {
-    "puppeteer": "^22.0.0"
   },
   "engines": {
     "node": ">=18.0.0"

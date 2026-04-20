@@ -69,7 +69,8 @@ function parsearRodada(item) {
   }
 
   const timestamp = (() => {
-    const t = d?.startedAt ?? d?.settledAt ?? d?.createdAt ?? d?.timestamp;
+    // Usar settledAt (quando a rodada terminou) para bater com o casino.org
+    const t = d?.settledAt ?? d?.startedAt ?? d?.createdAt ?? d?.timestamp;
     return t ? new Date(t).getTime() : Date.now();
   })();
 

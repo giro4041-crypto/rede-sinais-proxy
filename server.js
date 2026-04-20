@@ -146,8 +146,10 @@ async function getData() {
     } catch(e) { console.error('latest:', e.message); }
   }
 
-  rodadas.sort((a, b) => b.timestamp - a.timestamp);
-  cache.data = rodadas.slice(0, 10);
+  // Só guardar rodadas com mult >= 50
+  const comMult = rodadas.filter(r => r.multiplicador >= 50);
+  comMult.sort((a, b) => b.timestamp - a.timestamp);
+  cache.data = comMult.slice(0, 10);
   cache.lastFetch = agora;
   console.log(`[${new Date().toISOString()}] ${cache.data.length} rodadas no cache`);
   return { source: 'live', data: cache.data, lastFetch: agora };

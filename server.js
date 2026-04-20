@@ -1,6 +1,5 @@
 /*
-  REDE SINAIS — Proxy Server v8
-  Retorna os últimos 10 resultados com todos os multiplicadores
+  REDE SINAIS — Proxy Server v9
 */
 
 const https = require('https');
@@ -32,7 +31,7 @@ function fetchJSON(url) {
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
         try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
-        catch(e) { resolve({ status: res.statusCode, data: null }); }
+        catch(e) { resolve({ status: res.statusCode, data: null, raw: body.substring(0,300) }); }
       });
     });
     req.on('error', reject);
@@ -53,55 +52,58 @@ function parsearRodada(item) {
   const numero = parseInt(outcome.number ?? d.number ?? d.result ?? 0);
   const cor = getColor(outcome.color ?? d.color, numero);
 
-  // Buscar APENAS o multiplicador do número que saiu
+  // Pegar o multiplicador do número sorteado na lista relâmpago
   const luckyList = d?.result?.luckyNumbersList ?? d?.luckyNumbersList ?? d?.multipliers ?? [];
-
-  // Procurar o multiplicador correspondente ao número sorteado
+  
+  // Primeiro tentar achar o mult do número que saiu
   const luckyDoNumero = luckyList.find(m => parseInt(m?.number ?? m?.num) === numero);
   let multiplicador = 0;
   if (luckyDoNumero) {
     multiplicador = parseInt(luckyDoNumero?.roundedMultiplier ?? luckyDoNumero?.multiplier ?? luckyDoNumero?.value ?? 0);
   }
 
-  // Se o número sorteado não está na lista de relâmpago, não tem multiplicador especial
-  // Mas ainda assim incluímos a rodada com mult=0 para mostrar no histórico
-  const todosMultiplicadores = multiplicador > 0 ? [multiplicador] : [];
-
-  // Timestamp
-  const timeStr = d?.startedAt ?? d?.settledAt ?? d?.createdAt ?? d?.timestamp;
-  const timestamp = timeStr ? new Date(timeStr).getTime() : Date.now();
-  const horario = tsParaHorarioBRT(timestamp);
-
-  return { numero, cor, multiplicador, todosMultiplicadores, horario, timestamp };
-}
-
-async function getData() {
-  const agora = Date.now();
-  if (cache.data.length > 0 && agora - cache.lastFetch < cache.ttl) {
-    return { source: 'cache', data: cache.data, lastFetch: cache.lastFetch };
+  // Se o número não tinha mult, pegar o maior da rodada para referência
+  if (multiplicador === 0 && luckyList.length > 0) {
+    const todos = luckyList.map(m => parseInt(m?.roundedMultiplier ?? m?.multiplier ?? m?.value ?? 0)).filter(m => m > 0);
+    // Não usar mult de outros números — manter 0 para indicar que não houve relâmpago no número sorteado
   }
 
+  const timestamp = (() => {
+    const t = d?.startedAt ?? d?.settledAt ?? d?.createdAt ?? d?.timestamp;
+    return t ? new Date(t).getTime() : Date.now();
+  })();
+
+  return { numero, cor, multiplicador, todosMultiplicadores: multiplicador > 0 ? [multiplicador] : [], horario: tsParaHorarioBRT(timestamp), timestamp };
+}
+
+async function buscarHistorico() {
   const rodadas = [];
   const seen = new Set();
 
-  // Buscar histórico da última 6h para ter dados suficientes
+  // Tentar vários endpoints de histórico
   const endpoints = [
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/rounds?duration=6',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/history?duration=6',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/results?duration=1',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/list?duration=1',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/rounds?duration=1&limit=20',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/rounds?duration=1',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/history?limit=20',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/history',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/results?limit=20',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/spins?limit=20',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/list',
+    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette?limit=20',
   ];
 
   for (const url of endpoints) {
     try {
       const result = await fetchJSON(url);
+      console.log(`${url} → ${result.status} | raw: ${JSON.stringify(result.data ?? result.raw).substring(0,100)}`);
       if (result.status !== 200 || !result.data) continue;
+
       const arr = Array.isArray(result.data) ? result.data
         : result.data?.data ?? result.data?.results ?? result.data?.rounds
-        ?? result.data?.items ?? result.data?.history ?? [];
+        ?? result.data?.items ?? result.data?.history ?? result.data?.spins ?? [];
 
-      if (arr.length > 0) {
-        console.log(`${arr.length} itens em ${url}`);
+      if (arr.length > 1) {
+        console.log(`✓ Histórico encontrado: ${arr.length} itens em ${url}`);
         for (const item of arr) {
           const r = parsearRodada(item);
           if (!r || seen.has(r.horario)) continue;
@@ -113,21 +115,41 @@ async function getData() {
     } catch(e) { console.error(url, e.message); }
   }
 
-  // Se não achou histórico, pegar pelo menos a última rodada
-  if (rodadas.length === 0) {
+  return rodadas;
+}
+
+async function getData() {
+  const agora = Date.now();
+  if (cache.data.length > 0 && agora - cache.lastFetch < cache.ttl) {
+    return { source: 'cache', data: cache.data, lastFetch: cache.lastFetch };
+  }
+
+  let rodadas = await buscarHistorico();
+
+  // Se histórico não funcionou, usar latest e acumular no cache
+  if (rodadas.length <= 1) {
+    console.log('Histórico não disponível, usando latest + cache acumulado');
     try {
       const latest = await fetchJSON('https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/latest');
       if (latest.status === 200 && latest.data) {
         const r = parsearRodada(latest.data);
-        if (r) rodadas.push(r);
+        if (r) {
+          // Adicionar ao cache existente se for nova rodada
+          const jaExiste = cache.data.find(c => c.horario === r.horario);
+          if (!jaExiste) {
+            rodadas = [r, ...cache.data].slice(0, 10);
+          } else {
+            rodadas = cache.data;
+          }
+        }
       }
     } catch(e) { console.error('latest:', e.message); }
   }
 
   rodadas.sort((a, b) => b.timestamp - a.timestamp);
-  cache.data = rodadas.slice(0, 20); // guardar 20 no cache
+  cache.data = rodadas.slice(0, 10);
   cache.lastFetch = agora;
-  console.log(`[${new Date().toISOString()}] ${rodadas.length} rodadas`);
+  console.log(`[${new Date().toISOString()}] ${cache.data.length} rodadas no cache`);
   return { source: 'live', data: cache.data, lastFetch: agora };
 }
 
@@ -155,7 +177,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const result = await getData();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ total: result.data.length, primeiras3: result.data.slice(0,3) }, null, 2));
+      res.end(JSON.stringify({ total: result.data.length, rodadas: result.data.slice(0,5) }, null, 2));
     } catch(e) { res.writeHead(500); res.end(e.message); }
     return;
   }
@@ -171,6 +193,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Rede Sinais Proxy v8 na porta ${PORT}`);
+  console.log(`Rede Sinais Proxy v9 na porta ${PORT}`);
+  // Fazer poll a cada 30s para acumular histórico
   getData().catch(console.error);
+  setInterval(() => getData().catch(console.error), 30000);
 });

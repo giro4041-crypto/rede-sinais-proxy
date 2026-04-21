@@ -8,13 +8,21 @@ const PORT = process.env.PORT || 3000;
 let sinaisAtivos = [];
 let historicoCrash = [];
 
-// ================= HELPERS =================
+// ================= FETCH =================
 
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
+    const options = {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
+    };
+
+    https.get(url, options, (res) => {
       let body = '';
+
       res.on('data', chunk => body += chunk);
+
       res.on('end', () => {
         try {
           resolve(JSON.parse(body));
@@ -22,9 +30,12 @@ function fetchJSON(url) {
           resolve(null);
         }
       });
+
     }).on('error', reject);
   });
 }
+
+// ================= TEMPO =================
 
 function tsParaHorario(ts) {
   const d = new Date(ts);
@@ -65,6 +76,7 @@ function dentroDaJanela() {
 
 function detectar10x() {
   const ultimos = historicoCrash.slice(-20);
+
   const abaixo2 = ultimos.filter(x => x < 2).length;
   const acima10 = ultimos.filter(x => x >= 10).length;
 
@@ -73,6 +85,7 @@ function detectar10x() {
 
 function filtroForte() {
   const ultimos = historicoCrash.slice(-10);
+
   const abaixo2 = ultimos.filter(x => x < 2).length;
   const acima5 = ultimos.filter(x => x >= 5).length;
 
@@ -116,23 +129,21 @@ async function atualizarRoleta() {
   }
 }
 
-// ================= CRASH (API ESTÁVEL) =================
+// ================= CRASH REAL =================
 
 async function atualizarCrash() {
   try {
-    const data = await fetchJSON("https://blaze.com/api/crash_games/recent");
+    const data = await fetchJSON("https://api-v2.blaze.com/crash_games/recent");
 
-    if (!data) return;
+    if (!data || !Array.isArray(data)) return;
 
-    data.forEach(item => {
-      const crash = parseFloat(item.crash_point);
+    const novos = data
+      .map(item => parseFloat(item.crash_point))
+      .filter(x => !isNaN(x));
 
-      if (!isNaN(crash)) {
-        historicoCrash.push(crash);
-      }
-    });
+    historicoCrash = [...historicoCrash, ...novos];
 
-    // mantém só últimos 50
+    // mantém últimos 50
     historicoCrash = historicoCrash.slice(-50);
 
     console.log("💥 HISTÓRICO:", historicoCrash.length);

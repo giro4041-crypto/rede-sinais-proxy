@@ -1,17 +1,11 @@
-/*
-  REDE SINAIS — Server FINAL
-*/
-
 const https = require('https');
 const http = require('http');
-const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 
 // ================= ESTADO =================
 
 let sinaisAtivos = [];
-let ultimoEventoRoleta = null;
 let historicoCrash = [];
 
 // ================= HELPERS =================
@@ -71,7 +65,6 @@ function dentroDaJanela() {
 
 function detectar10x() {
   const ultimos = historicoCrash.slice(-20);
-
   const abaixo2 = ultimos.filter(x => x < 2).length;
   const acima10 = ultimos.filter(x => x >= 10).length;
 
@@ -80,7 +73,6 @@ function detectar10x() {
 
 function filtroForte() {
   const ultimos = historicoCrash.slice(-10);
-
   const abaixo2 = ultimos.filter(x => x < 2).length;
   const acima5 = ultimos.filter(x => x >= 5).length;
 
@@ -88,13 +80,7 @@ function filtroForte() {
 }
 
 function verificarEntrada() {
-  if (!sinaisAtivos.length) return false;
-
-  if (dentroDaJanela() && detectar10x() && filtroForte()) {
-    return true;
-  }
-
-  return false;
+  return sinaisAtivos.length && dentroDaJanela() && detectar10x() && filtroForte();
 }
 
 // ================= ROLETA =================
@@ -121,7 +107,6 @@ async function atualizarRoleta() {
       ...tempo
     };
 
-    ultimoEventoRoleta = dados;
     sinaisAtivos = gerarSinais(dados);
 
     console.log("🎯 SINAIS:", sinaisAtivos);
@@ -131,86 +116,71 @@ async function atualizarRoleta() {
   }
 }
 
-// ================= CRASH (WEBSOCKET) =================
+// ================= CRASH (API ESTÁVEL) =================
 
-function conectarCrash() {
-  const ws = new WebSocket("wss://api-v2.blaze.com/replication/?EIO=3&transport=websocket");
+async function atualizarCrash() {
+  try {
+    const data = await fetchJSON("https://blaze.com/api/crash_games/recent");
 
-  ws.on("open", () => {
-    ws.send('420["cmd",{"id":"subscribe","payload":{"room":"crash_v2"}}]');
-  });
+    if (!data) return;
 
-  ws.on("message", (msg) => {
-    const str = msg.toString();
+    data.forEach(item => {
+      const crash = parseFloat(item.crash_point);
 
-    if (str.includes("crash.tick")) {
-      try {
-        const json = JSON.parse(str.slice(2));
-        const payload = json[1].payload;
+      if (!isNaN(crash)) {
+        historicoCrash.push(crash);
+      }
+    });
 
-        if (payload.status === "complete") {
-          const crash = parseFloat(payload.crash_point);
+    // mantém só últimos 50
+    historicoCrash = historicoCrash.slice(-50);
 
-          historicoCrash.push(crash);
+    console.log("💥 HISTÓRICO:", historicoCrash.length);
 
-          if (historicoCrash.length > 100) {
-            historicoCrash.shift();
-          }
-
-          console.log("💥 CRASH:", crash);
-        }
-      } catch {}
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("Reconectando crash...");
-    setTimeout(conectarCrash, 3000);
-  });
+  } catch (e) {
+    console.log("Erro crash:", e.message);
+  }
 }
-
-conectarCrash();
 
 // ================= SERVER =================
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
 
-  if (req.url === "/api/painel") {
-    res.end(JSON.stringify({
-      sinais: sinaisAtivos,
-      entrada: verificarEntrada(),
-      historico: historicoCrash.slice(-20)
-    }));
-    return;
+  try {
+
+    if (req.url === "/api/painel") {
+      res.end(JSON.stringify({
+        sinais: sinaisAtivos,
+        entrada: verificarEntrada(),
+        historico: historicoCrash.slice(-20)
+      }));
+      return;
+    }
+
+    if (req.url === "/health") {
+      res.end(JSON.stringify({
+        ok: true,
+        sinais: sinaisAtivos.length
+      }));
+      return;
+    }
+
+    res.end(JSON.stringify({ ok: true }));
+
+  } catch (e) {
+    res.statusCode = 500;
+    res.end(JSON.stringify({ erro: e.message }));
   }
-
-  if (req.url === "/health") {
-    res.end(JSON.stringify({
-      ok: true,
-      sinais: sinaisAtivos.length
-    }));
-    return;
-  }
-
-  res.end("OK");
 });
 
 // ================= LOOP =================
 
 setInterval(atualizarRoleta, 5000);
-setInterval(() => {
-  const fake = parseFloat((Math.random() * 5).toFixed(2));
+setInterval(atualizarCrash, 5000);
 
-  historicoCrash.push(fake);
-
-  if (historicoCrash.length > 50) {
-    historicoCrash.shift();
-  }
-
-  console.log("FAKE CRASH:", fake);
-
-}, 1500);
+// ================= START =================
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("🚀 Server rodando na porta", PORT);

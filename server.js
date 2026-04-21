@@ -199,6 +199,18 @@ const server = http.createServer(async (req, res) => {
 // ================= LOOP =================
 
 setInterval(atualizarRoleta, 5000);
+setInterval(() => {
+  const fake = parseFloat((Math.random() * 5).toFixed(2));
+
+  historicoCrash.push(fake);
+
+  if (historicoCrash.length > 50) {
+    historicoCrash.shift();
+  }
+
+  console.log("FAKE CRASH:", fake);
+
+}, 1500);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("🚀 Server rodando na porta", PORT);

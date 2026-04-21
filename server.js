@@ -1,203 +1,194 @@
 /*
-  REDE SINAIS — Proxy Server v9
+  REDE SINAIS — Proxy Server v10 (com sinais + motor)
 */
 
 const https = require('https');
 const http = require('http');
+
 const PORT = process.env.PORT || 3000;
 
-const COLOR_MAP = {'Black':'preto','Red':'vermelho','Green':'branco','black':'preto','red':'vermelho','green':'branco'};
-const NUM_COLORS = {0:'branco',1:'vermelho',2:'preto',3:'vermelho',4:'preto',5:'vermelho',6:'preto',7:'vermelho',8:'preto',9:'vermelho',10:'preto',11:'preto',12:'vermelho',13:'preto',14:'vermelho',15:'preto',16:'vermelho',17:'preto',18:'vermelho',19:'vermelho',20:'preto',21:'vermelho',22:'preto',23:'vermelho',24:'preto',25:'vermelho',26:'preto',27:'vermelho',28:'preto',29:'preto',30:'vermelho',31:'preto',32:'vermelho',33:'preto',34:'vermelho',35:'preto',36:'vermelho'};
-
-function getColor(colorStr, numero) {
-  if (colorStr && COLOR_MAP[colorStr]) return COLOR_MAP[colorStr];
-  return NUM_COLORS[parseInt(numero)] || 'branco';
-}
+// ================= VARIÁVEIS =================
 
 let cache = { data: [], lastFetch: 0, ttl: 30000 };
 
+let ultimoEventoRoleta = null;
+let sinaisAtivos = [];
+let historicoCrash = []; // você pode integrar depois com seu Python se quiser
+
+// ================= HELPERS =================
+
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://www.casino.org/',
-        'Origin': 'https://www.casino.org',
-      }
-    }, (res) => {
+    const req = https.get(url, {}, (res) => {
       let body = '';
-      res.setEncoding('utf8');
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
-        catch(e) { resolve({ status: res.statusCode, data: null, raw: body.substring(0,300) }); }
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
       });
     });
     req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
 function tsParaHorarioBRT(ts) {
   const d = new Date(ts);
-  const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-  const brt = new Date(utc - 3 * 3600000);
-  return String(brt.getHours()).padStart(2,'0')+':'+String(brt.getMinutes()).padStart(2,'0')+':'+String(brt.getSeconds()).padStart(2,'0');
+  return {
+    hora: d.getHours(),
+    minuto: d.getMinutes(),
+    segundo: d.getSeconds(),
+    dia: d.getDate(),
+    mes: d.getMonth() + 1
+  };
 }
+
+// ================= ROLETA =================
+
+function gerarSinais(dados) {
+  const { numero, multiplicador, hora, minuto, segundo, dia, mes } = dados;
+
+  let base = numero.toString().split('').reduce((a,b)=>a+parseInt(b),0) + multiplicador;
+  let parcial = base.toString().split('').reduce((a,b)=>a+parseInt(b),0);
+  let tempo = parcial + (hora+minuto+segundo);
+  let data = tempo + (dia+mes);
+
+  return [
+    data % 60,
+    (data + 7) % 60,
+    (data + 34) % 60,
+    (data + 27) % 60 // ajuste extra
+  ];
+}
+
+// ================= FILTROS =================
+
+function dentroDaJanela() {
+  const agora = new Date();
+  return sinaisAtivos.includes(agora.getMinutes()) && agora.getSeconds() <= 10;
+}
+
+function detectar10x() {
+  const ultimos = historicoCrash.slice(-20);
+
+  const abaixo2 = ultimos.filter(x => x < 2).length;
+  const acima10 = ultimos.filter(x => x >= 10).length;
+
+  return abaixo2 >= 7 && acima10 === 0;
+}
+
+function filtroForte() {
+  const ultimos = historicoCrash.slice(-10);
+
+  const abaixo2 = ultimos.filter(x => x < 2).length;
+  const acima5 = ultimos.filter(x => x >= 5).length;
+
+  return abaixo2 >= 5 && acima5 <= 1;
+}
+
+function verificarEntrada() {
+  if (!sinaisAtivos.length) return false;
+
+  if (dentroDaJanela() && detectar10x() && filtroForte()) {
+    return true;
+  }
+
+  return false;
+}
+
+// ================= PARSE ROLETA =================
 
 function parsearRodada(item) {
-  const d = item.data ?? item;
-  const outcome = d?.result?.outcome ?? d?.outcome ?? {};
-  const numero = parseInt(outcome.number ?? d.number ?? d.result ?? 0);
-  const cor = getColor(outcome.color ?? d.color, numero);
+  const numero = item.result?.outcome?.number || item.number || 0;
+  const multiplicador = item.result?.luckyNumbersList?.[0]?.multiplier || 0;
 
-  // Pegar o multiplicador do número sorteado na lista relâmpago
-  const luckyList = d?.result?.luckyNumbersList ?? d?.luckyNumbersList ?? d?.multipliers ?? [];
-  
-  // Primeiro tentar achar o mult do número que saiu
-  const luckyDoNumero = luckyList.find(m => parseInt(m?.number ?? m?.num) === numero);
-  let multiplicador = 0;
-  if (luckyDoNumero) {
-    multiplicador = parseInt(luckyDoNumero?.roundedMultiplier ?? luckyDoNumero?.multiplier ?? luckyDoNumero?.value ?? 0);
-  }
+  const ts = new Date(item.settledAt || Date.now()).getTime();
+  const tempo = tsParaHorarioBRT(ts);
 
-  // Se o número não tinha mult, pegar o maior da rodada para referência
-  if (multiplicador === 0 && luckyList.length > 0) {
-    const todos = luckyList.map(m => parseInt(m?.roundedMultiplier ?? m?.multiplier ?? m?.value ?? 0)).filter(m => m > 0);
-    // Não usar mult de outros números — manter 0 para indicar que não houve relâmpago no número sorteado
-  }
+  const dados = {
+    numero,
+    multiplicador,
+    ...tempo
+  };
 
-  const timestamp = (() => {
-    // Usar settledAt (quando a rodada terminou) para bater com o casino.org
-    const t = d?.settledAt ?? d?.startedAt ?? d?.createdAt ?? d?.timestamp;
-    return t ? new Date(t).getTime() : Date.now();
-  })();
+  ultimoEventoRoleta = dados;
+  sinaisAtivos = gerarSinais(dados);
 
-  return { numero, cor, multiplicador, todosMultiplicadores: multiplicador > 0 ? [multiplicador] : [], horario: tsParaHorarioBRT(timestamp), timestamp };
+  console.log("🎯 SINAIS:", sinaisAtivos);
+
+  return dados;
 }
 
-async function buscarHistorico() {
-  const rodadas = [];
-  const seen = new Set();
-
-  // Tentar vários endpoints de histórico
-  const endpoints = [
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/rounds?duration=1&limit=20',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/rounds?duration=1',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/history?limit=20',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/history',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/results?limit=20',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/spins?limit=20',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/list',
-    'https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette?limit=20',
-  ];
-
-  for (const url of endpoints) {
-    try {
-      const result = await fetchJSON(url);
-      console.log(`${url} → ${result.status} | raw: ${JSON.stringify(result.data ?? result.raw).substring(0,100)}`);
-      if (result.status !== 200 || !result.data) continue;
-
-      const arr = Array.isArray(result.data) ? result.data
-        : result.data?.data ?? result.data?.results ?? result.data?.rounds
-        ?? result.data?.items ?? result.data?.history ?? result.data?.spins ?? [];
-
-      if (arr.length > 1) {
-        console.log(`✓ Histórico encontrado: ${arr.length} itens em ${url}`);
-        for (const item of arr) {
-          const r = parsearRodada(item);
-          if (!r || seen.has(r.horario)) continue;
-          seen.add(r.horario);
-          rodadas.push(r);
-        }
-        if (rodadas.length >= 10) break;
-      }
-    } catch(e) { console.error(url, e.message); }
-  }
-
-  return rodadas;
-}
+// ================= BUSCA =================
 
 async function getData() {
   const agora = Date.now();
+
   if (cache.data.length > 0 && agora - cache.lastFetch < cache.ttl) {
-    return { source: 'cache', data: cache.data, lastFetch: cache.lastFetch };
+    return cache.data;
   }
 
-  let rodadas = await buscarHistorico();
+  try {
+    const data = await fetchJSON(
+      "https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/latest"
+    );
 
-  // Se histórico não funcionou, usar latest e acumular no cache
-  if (rodadas.length <= 1) {
-    console.log('Histórico não disponível, usando latest + cache acumulado');
-    try {
-      const latest = await fetchJSON('https://api-cs.casino.org/svc-evolution-game-events/api/xxxtremelightningroulette/latest');
-      if (latest.status === 200 && latest.data) {
-        const r = parsearRodada(latest.data);
-        if (r) {
-          // Adicionar ao cache existente se for nova rodada
-          const jaExiste = cache.data.find(c => c.horario === r.horario);
-          if (!jaExiste) {
-            rodadas = [r, ...cache.data].slice(0, 10);
-          } else {
-            rodadas = cache.data;
-          }
-        }
-      }
-    } catch(e) { console.error('latest:', e.message); }
+    if (data) {
+      parsearRodada(data);
+      cache.data = [data];
+      cache.lastFetch = agora;
+    }
+  } catch (e) {
+    console.log("Erro fetch:", e.message);
   }
 
-  // Só guardar rodadas com mult >= 50
-  const comMult = rodadas.filter(r => r.multiplicador >= 50);
-  comMult.sort((a, b) => b.timestamp - a.timestamp);
-  cache.data = comMult.slice(0, 10);
-  cache.lastFetch = agora;
-  console.log(`[${new Date().toISOString()}] ${cache.data.length} rodadas no cache`);
-  return { source: 'live', data: cache.data, lastFetch: agora };
+  return cache.data;
 }
+
+// ================= SERVER =================
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  const url = req.url.split('?')[0];
+  if (req.url === "/api/roleta") {
+    const data = await getData();
 
-  if (url === '/api/roleta' || url === '/') {
-    try {
-      const result = await getData();
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: true, source: result.source, lastFetch: result.lastFetch, total: result.data.length, rodadas: result.data }));
-    } catch(err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: err.message }));
-    }
+    res.end(JSON.stringify({
+      ok: true,
+      sinais: sinaisAtivos,
+      roleta: ultimoEventoRoleta
+    }));
     return;
   }
 
-  if (url === '/debug') {
-    try {
-      const result = await getData();
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ total: result.data.length, rodadas: result.data.slice(0,5) }, null, 2));
-    } catch(e) { res.writeHead(500); res.end(e.message); }
+  if (req.url === "/api/painel") {
+    res.end(JSON.stringify({
+      sinais: sinaisAtivos,
+      entrada: verificarEntrada(),
+      historico: historicoCrash.slice(-10)
+    }));
     return;
   }
 
-  if (url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, uptime: process.uptime(), cacheSize: cache.data.length }));
+  if (req.url === "/health") {
+    res.end(JSON.stringify({
+      ok: true,
+      sinais: sinaisAtivos.length
+    }));
     return;
   }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ ok: false, error: 'Not found' }));
+  res.end("OK");
 });
 
+// ================= LOOP =================
+
+setInterval(() => {
+  getData();
+}, 5000);
+
 server.listen(PORT, () => {
-  console.log(`Rede Sinais Proxy v9 na porta ${PORT}`);
-  // Fazer poll a cada 30s para acumular histórico
-  getData().catch(console.error);
-  setInterval(() => getData().catch(console.error), 30000);
+  console.log("🚀 Server rodando na porta", PORT);
 });
